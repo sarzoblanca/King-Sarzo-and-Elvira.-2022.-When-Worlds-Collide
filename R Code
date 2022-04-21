@@ -1,0 +1,647 @@
+## Code for simulation study
+## King, Sarzo and Elvira, 2022 (Biometrics)
+
+## Packages
+library(xtable)
+library(R2jags)
+library(rjags)
+library(dclone)
+library(foreach)
+library(doParallel)
+library(snow)
+library(splitstackshape)
+library(nimble, warn.conflicts = FALSE)
+library(MCMCvis)
+library(plyr)
+library(dplyr)
+library(MCMCglmm)
+library(ggplot2)
+
+## Environment
+setwd("~/Escritorio/IS/Final/")
+
+## Define parameter values
+n.occasions <- 11
+
+###########################
+## The simulated database
+###########################
+## Annual number of newly marked individuals
+marked <- c(c(rep(500,3), rep(1000,6), 2950)) # 10450 individuals
+mu <- 0.62
+p <- rep(0.13, n.occasions-1)
+sigma <- 0.5
+epsilon <- rnorm(10450,0,sigma)
+
+# Draw annual survival probabilities
+logit.phi <- rnorm(sum(marked), (mu+epsilon), sigma) # rnorm uses sigma, not sigma^2
+phi <- plogis(logit.phi)
+
+# Define matrices with survival and recapture probabilities
+PHI <- matrix(phi, ncol = n.occasions-1, nrow = sum(marked),byrow = FALSE)
+P <- matrix(p, ncol = n.occasions-1, nrow = sum(marked))
+
+# Define function to simulate a capture-history (CH) matrix
+simul.cjs <- function(PHI, P, marked){
+  n.occasions <- dim(PHI)[2] + 1
+  CH <- matrix(0, ncol = n.occasions, nrow = sum(marked))
+  # Define a vector with the occasion of marking
+  mark.occ <- rep(1:length(marked), marked[1:length(marked)])
+  # Fill the CH matrix
+  for (i in 1:sum(marked)){
+    CH[i, mark.occ[i]] <- 1
+    # Write an 1 at the release occasion
+    if (mark.occ[i]==n.occasions) next
+    for (t in (mark.occ[i]+1):n.occasions){
+      # Bernoulli trial: does individual survive occasion?
+      sur <- rbinom(1, 1, PHI[i,t-1])
+      if (sur==0) break
+      # If dead, move to next individual
+      # Bernoulli trial: is individual recaptured?
+      rp <- rbinom(1, 1, P[i,t-1])
+      if (rp==1) CH[i,t] <- 1
+    } #t
+  } #i
+  return(CH)
+}
+
+# Execute function
+new_simulated_DB <- simul.cjs(PHI, P, marked)
+
+## We include ID number for SIR and subsamples
+ID <- c(1:dim(new_simulated_DB)[1])
+new_simulated_DB1 <- as.data.frame(new_simulated_DB)
+new_simulated_DB <- cbind(ID, new_simulated_DB1)
+
+## Remove ID
+new_simulated_DB <- as.data.frame(new_simulated_DB[,-1]) 
+
+## Include the cohort number
+get.first <- function(x) min(which(x!=0)) 
+coh <- apply(new_simulated_DB, 1, get.first)
+
+## Last time seen
+last.one <- function(x) max(which(x!=0))
+l <- apply(new_simulated_DB,1,last.one)
+ID <- c(1:10450)
+
+sim_data2_new <- cbind(ID, new_simulated_DB, coh, l)
+
+
+######################################################
+## 1. SUBSAMPLING: BY COHORTS AND LAST TIME RESIGHTED
+## Size: 20%
+######################################################
+set.seed(100) # to compare outputs
+
+load("~/Dropbox/Ruth_Blanca/Simulated_real_sch5/New_simulated_DB/sim_data2_new.RData")
+
+data <- sim_data2_new
+num <- 150
+
+sub <- data.frame(0, ncol=dim(data)[2], nrow=dim(data)[1])
+
+for (i in 1:max(num)){
+  num <- i
+  sub <- stratified(data,c("coh", "l"), size=.2, replace=FALSE) 
+  saveRDS(sub, paste0("subsample_", i, ".RDS"))
+}
+
+##############
+### 2. MCMC
+##############
+## Functions
+last.seen <- function(x) max(which(x!=0))
+get.first <- function(x) min(which(x!=0))
+
+##############
+## 2.1. NIMBLE
+##############
+## Code
+modelSIM <- nimbleCode({
+  # Priors and constraints
+  for (i in 1:nind){
+    for (t in f[i]:(n.occasions-1)){
+      logit(phi[i,t]) <- alpha + epsilon[i]
+      p[i,t] <- mean.p
+    } 
+  }
+  for (i in 1:nind){
+    epsilon[i] ~ dnorm(0,tau)
+  }
+  
+  # Priors
+  alpha ~ dnorm(0,0.1)
+  sigma ~ dunif(0, 10)
+  tau <- 1/(sigma*sigma)
+  sigma2 <- pow(sigma, 2)
+  mean.p ~ dunif(0, 1)
+  
+  # Likelihood
+  for (i in 1:nind){
+    # Define latent state at first capture
+    z[i,f[i]] <- 1
+    for (t in (f[i]+1):n.occasions){
+      # State process
+      z[i,t] ~ dbern(mu1[i,t])
+      mu1[i,t] <- phi[i,t-1] * z[i,t-1]
+      # Observation process
+      y[i,t] ~ dbern(mu2[i,t])
+      mu2[i,t] <- p[i,t-1] * z[i,t]
+    } 
+  } 
+})
+
+toc <- Sys.time()
+
+for (i in 1:max(num)){
+  sub1 <- readRDS(paste0("subsample_", i, ".RDS"))
+  ## Remove the coh and last time seen
+  sub <- sub1[,-c(13:14)]
+  ## Remove ID
+  CH <- as.matrix(sub[,-1])
+  ## Ringing vector (f_i) 
+  f <- apply(CH, 1, get.first)
+  l <- apply(CH, 1, last.seen)
+  
+  ## Known values of the latent variable Z (1's, 0's, NAs)
+  known.state.cjs <- function(ch){
+    state <- ch
+    for (i in 1:dim(ch)[1]){
+      n1 <- min(which(ch[i,]==1))         
+      n2 <- max(which(ch[i,]==1))         
+      state[i, n1:n2] <- 1             
+    }
+    state[state==0] <- NA                 
+    return(state)
+  }
+  
+  ## Function to simulate for some fixed z's 
+  fixed.state.cjs <- function(ch){
+    state <- ch
+    for (i in 1:dim(ch)[1]){
+      n1 <- min(which(ch[i,]==1))         
+      n2 <- max(which(ch[i,]==1))         
+      state[i, n1:n2] <- 1          
+      
+      if (n2 != dim(ch)[2]) {
+        death <- sample(c(n2:dim(ch)[2]),1)
+        if (death != n2){
+          for (j in (n2+1):death){
+            state[i,j] <- 1
+          }
+        }       
+      }
+    }
+    return(state)
+  }
+  
+  ## Function  to create initial values of Z - this randomly
+  ## simulates the time of death following final capture 
+  
+  cjs.init.z <- function(ch,f,l){
+    
+    inz <- ch
+    for(i in 1:dim(ch)[1]){
+      if(sum(ch[i,])==1) next
+      n2 <- max(which(ch[i,]==1))
+      inz[i, f[i]:n2] <- NA
+    }
+    for(i in 1: dim(ch)[1]){
+      inz[i, 1:f[i]] <- NA
+    }
+    
+    # To randomly add in time of death 
+    # (Uniform over time after last sighting)  
+    
+    for(i in 1: dim(ch)[1]){
+      if (l[i] != dim(ch)[2]) {
+        death <- sample(c(l[i]:dim(ch)[2]),1)
+        if (death != l[i]){
+          for (j in (l[i]+1):death){
+            inz[i,j] <- 1
+          }
+        }
+      }
+    }
+    
+    return(inz)
+  }
+  
+  fixedz <- fixed.state.cjs(CH)
+  z <- known.state.cjs(CH)
+  z2 <- cjs.init.z(CH, f, l)
+  nind <- dim(CH)[1]
+  n.occasions <- dim(CH)[2]
+  y <- CH
+  
+  ## Priors
+  inepsilon1 <- rnorm(nind,0,1)
+  
+  ## Data 
+  dataSIM <- list(y=y,z=z)
+  
+  constants <- list(nind=nind,n.occasions=n.occasions,f=f)
+  
+  ## Initial values
+  inits <- function() list(mean.p=runif(1,0,1), z=z2,epsilon=inepsilon1)
+  
+  ### Parameters
+  parameters <- c("phi", "mean.p", "alpha", "epsilon","sigma2")
+  
+  ## Run NIMBLE
+  NIMBLE_sim <- nimbleMCMC(code = modelSIM,
+                           data = dataSIM,
+                           inits = inits,
+                           constants = constants,
+                           monitors = parameters,
+                           niter = 25000,
+                           nburnin = 1500,
+                           nchains = 1,
+                           samples=TRUE)
+}
+
+##############
+## 2.2. JAGS
+##############
+## Heterogeneity model
+## Model: logit(phi_it)= mu + epsilon_i ; p_it=p
+## We run the chains in parallel
+## If we set epsilon ~ N(0, tau) the convergence is not good enough
+## with 8000 iterations (23 minutes)
+## In Kéry & Schaub book they propose a truncated zero-mean normal
+## e[i] ~ dnorm(0, tau)I(–20,20); reference: Kéry & Royle, 2009.
+
+sink("cjs_heter.jags")
+cat("
+    model {
+    # Priors and constraints
+    for (i in 1:nind){
+    for (t in f[i]:(n.occasions-1)){
+    logit(phi[i,t]) <- mu + epsilon[i]
+    p[i,t] <- mean.p
+    } 
+    } 
+    for (i in 1:nind){
+    epsilon[i] ~ dnorm(0,tau)T(-20,20)
+    }
+    
+    # Priors
+    mean.phi ~ dunif(0, 1)
+    # mu <- log(mean.phi / (1-mean.phi)) # Logit transformation
+    mu ~ dnorm(0,0.1)
+    sigma ~ dunif(0, 10)
+    tau <- 1/(sigma*sigma)
+    # tau ~ dnorm(0,0.1)
+    sigma2 <- pow(sigma, 2)
+    mean.p ~ dunif(0, 1)
+    
+    # Likelihood
+    for (i in 1:nind){
+    # Define latent state at first capture
+    z[i,f[i]] <- 1
+    for (t in (f[i]+1):n.occasions){
+    # State process
+    z[i,t] ~ dbern(mu1[i,t])
+    mu1[i,t] <- phi[i,t-1] * z[i,t-1]
+    # Observation process
+    y[i,t] ~ dbern(mu2[i,t])
+    mu2[i,t] <- p[i,t-1] * z[i,t]
+    } 
+    } 
+    }
+    ",fill = TRUE)
+sink()
+
+## Parallelization
+n.cores <- detectCores()
+n.cores <- 3
+
+## Number of subsamples
+set.seed(100)
+#num <- 150
+num <- 75
+
+toc <- Sys.time()
+
+# for (i in 1:max(num)){
+for (i in 1:10){
+  #num <- i
+  sub1 <- readRDS(paste0("subsample_", i, ".RDS"))
+  ## Remove the coh and last time seen
+  sub <- sub1[,-c(13:14)]
+  ## Remove ID
+  CH <- as.matrix(sub[,-1])
+  ## Ringing vector (f_i) 
+  f <- apply(CH, 1, get.first)
+  
+  ## Known values of the latent variable Z
+  known.state.cjs <- function(ch){
+    state <- ch
+    for (i in 1:dim(ch)[1]){
+      n1 <- min(which(ch[i,]==1))         
+      n2 <- max(which(ch[i,]==1))         
+      state[i, n1:n2] <- 1                
+      state[i, n1] <- NA                  
+    }
+    state[state==0] <- NA                 
+    return(state)
+  }
+  
+  ## Function  to create initial values of Z
+  cjs.init.z <- function(ch,f){
+    for(i in 1: dim(ch)[1]){            
+      if(sum(ch[i,])==1) next           
+      n2 <- max(which(ch[i,]==1))       
+      ch[i, f[i]:n2] <- NA              
+    }
+    for (i in 1: dim(ch)[1]){         
+      ch[i, 1:f[i]] <- NA             
+    }
+    return(ch)
+  }
+  
+  
+  jags.data <- list(y=CH, f=f, nind=dim(CH)[1], n.occasions=dim(CH)[2], z=known.state.cjs(CH))
+  
+  ### Initial values
+  inits <- function(){list(mean.p=runif(1,0,1), z = cjs.init.z(CH, f))}
+  
+  ### Parameters
+  parameters <- c("mean.p", "mu", "sigma2")
+  
+  ### MCMC settings
+  ni <- 15000
+  nt <- 1
+  nb <- 5000
+  nc <- 3
+  
+  ### Call JAGS
+  cl <- makePSOCKcluster(n.cores)
+  tmp <- clusterEvalQ(cl, library(dclone))
+  parLoadModule(cl, 'dic')
+  posterior <- jags.parfit(cl = cl, data = jags.data, params = parameters, model = "cjs_heter.jags", 
+                           n.chains = nc, n.adapt = 100, n.update = nb,n.iter = ni,thin = nt)
+  
+  stopCluster(cl)
+  saveRDS(posterior, paste0("posterior_", i, ".RDS"))
+}
+
+tic <- Sys.time()
+print(tic-toc) 
+
+###########################
+## THINNING APPROACH
+###########################
+##############
+## N= 1,000
+##############
+## Seed
+set.seed(100)
+
+## Full (simulated) db
+db <- readRDS("~/Dropbox/Ruth_Blanca/Simulated_real_sch5/New_simulated_DB/sim_data2_new.RDS")
+
+nSub <- 100
+
+toc <- Sys.time()
+
+for (s in 1:nSub){
+  ## Posterior subsample distribution
+  posterior <- readRDS(paste0("posterior_",s,".RDS"))
+  
+  ## Subsamples
+  subsample <- readRDS(paste0("subsample_",s,".RDS"))
+  sim_sam <- db[-subsample$ID,] 
+  
+  ## x2 matrix 
+  x2 <- as.data.frame(sim_sam[,2:12])
+  
+  ## Function to create the capture histories as character
+  pasty<-function(x) {
+    k<-ncol(x)
+    n<-nrow(x)
+    out<-array(dim=n)
+    for (i in 1:n){
+      data <- (x[i,]>0)*1
+      out[i]<-paste(data[1],data[2],data[3],data[4],data[5],data[6],data[7],data[8],data[9],data[10],data[11],sep="")
+    }
+    return(out)
+  }
+  
+  ## Faster
+  type <- as.character(pasty(x2))
+  x2.ch <- cbind(x2, type)
+  
+  ## How may different ch's
+  uniq.ch <- as.data.frame(table(type))
+  names(uniq.ch) <- c("type", "num")
+  uniq.ch$type <- as.character(uniq.ch$type) 
+  
+  ## We reduce the x2 matrix to the unique ch's only
+  ## We first join
+  temp <- left_join(x2.ch, uniq.ch, by="type")
+  x2.uniq <- temp[!duplicated(temp$type), ]
+  
+  ## Continue!
+  x2 <- as.matrix(x2.uniq[,-c(12:13)])
+  x2.uniq1 <- x2.uniq$num
+  
+  ## THE THINNING!
+  thin <- seq(1,45000, by=45) # 1000
+  
+  ## Posterior parameter distributions
+  ## Survival
+  mu.phi <- MCMCchains(posterior, params="mu", mcmc.list=TRUE) 
+  mu <- c(mu.phi[[1]],mu.phi[[2]],mu.phi[[3]])
+  mu <- mu[thin] 
+  
+  ## Recapture
+  mean.p <- MCMCchains(posterior, params="mean.p", mcmc.list=TRUE)
+  p <- c(mean.p[[1]],mean.p[[2]],mean.p[[3]])
+  p <- p[thin] 
+  
+  ## Individual effects
+  mean.sigma2 <- MCMCchains(posterior, params="sigma2", 
+                            mcmc.list=TRUE)
+  sigma2 <- c(mean.sigma2[[1]],mean.sigma2[[2]],mean.sigma2[[3]])
+  sigma <- sqrt(sigma2)
+  sigma <- sigma[thin] 
+  
+  ## Input controls:
+  n.iter <- length(mu) 
+  n.x2 <- dim(x2)[1] # Number of individuals in x2
+  n.MC <- 100 # Number of MC iterations
+  n.occasions <- dim(x2)[2]
+  
+  ## We indicate the first and the last 1
+  get.first <- function(x) min(which(x!=0)) 
+  f <- apply(x2, 1, get.first)
+  
+  last.one <- function(x) max(which(x!=0))
+  l <- apply(x2,1,last.one)
+  
+  
+  ## Log-likelihood function
+  loglikfn <- function(phi1,hist,f1,l1,p1,n.occasions) {
+    lik <- 0
+    if (f1!=l1) {
+      lik <- lik + (l1-f1)*log(phi1)
+      
+      for (j in f1:(l1-1)) {
+        lik <- lik + hist[j+1]*log(p1) + (1-hist[j+1])*log(1-p1)
+      }
+    }
+    
+    # To calculate the probability of not being observed 
+    # again in the study:
+    chi <- 1
+    if (l1 < n.occasions){
+      for (j in (n.occasions-1):l1){
+        chi <- (1-phi1) + phi1*(1-p1)*chi
+      }
+    }
+    lik <- lik + log(chi)
+    lik
+  }
+  
+  ## Define needed vectors, matrices,...
+  phi.new <- array(1, dim=c(n.x2, n.MC))
+  loglik <- loglik2 <- array(0,dim=c(n.x2,n.MC))
+  loglik3 <- loglik3a <- loglik3b <- array(0,dim=c(n.iter,n.x2))
+  loglik4 <- lik.thin.MC100 <- c()
+  
+  # For stratified sampling
+  # (and for importance sampling within MC estimate)
+  p1.MC <- c(0:(n.MC-1)/n.MC)
+  p2.MC <- c(1:n.MC/n.MC)
+  
+  for (k in 1:n.iter){
+    cat("k", k,  "\n")
+    
+    q1.MC <- qnorm(p1.MC,0,sigma[k])
+    q2.MC <- qnorm(p2.MC,0,sigma[k])
+    kronecker.q1 <- kronecker(q1.MC,rep(1,n.x2))
+    kronecker.q2 <- kronecker(q2.MC,rep(1,n.x2))
+    
+    # Simulate individual heterogeneity term using 
+    # quantiles of N(0,sigma2) - stratified MC integration:
+    epsilon <- array(rtnorm((n.x2*n.MC),0,sigma[k],lower=kronecker.q1,upper=kronecker.q2),dim=c(n.x2,n.MC))
+    
+    epsilon <- epsilon + mu[k]
+    
+    # Calculate log-likelihood conditional on epsilon
+    for (i in 1:n.x2) {
+      phi.new[i,] <- 1/(1+exp(-epsilon[i,]))
+      hist <- x2[i,]
+      
+      for (j in 1:n.MC){
+        loglik[i,j] <- loglikfn(phi1=phi.new[i,j],hist=hist,f1=f[i],l1=l[i],p1=p[k],n.occasions)
+      }
+    }
+    
+    ## Sum over particles to get the log-likelihood for the given histories:
+    
+    for (i in 1:n.x2){
+      loglik3[k,i] <- log(mean(exp(loglik[i,])))   # Calculate the log of the expected capture history probability
+      loglik3a[k,i] <- x2.uniq1[i]*loglik3[k,i]    # Account for the number of individuals with history (on log scale)
+    }
+    
+    ## We want the mean of the likelihood - so would simply usually exponentiate and taken the mean - 
+    ## but this leads to numerical underflow.
+    ## Thus we retain these values and will multiply by some large number (or add a large number of log scale)
+    ## This needs to be the same across all particles and so we simply retain the values here in a matrix
+    
+  }
+  
+  # Due to numerical underflow we make an additive correction on the log scale applied to all particles. 
+  
+  maxloglik <- mean(loglik3a)
+  loglik3b <- loglik3a - maxloglik
+  
+  for (k in 1:n.iter){
+    loglik4[k] <- exp(sum(loglik3b[k,]))
+  }
+  
+  # Calculate MC estimate as empirical mean of likelihood contributions given epsilon:
+  
+  for (k in 1:n.iter){
+    lik.thin.MC100[k] <- loglik4[k]/sum(loglik4)
+  }
+  
+  saveRDS(lik.thin.MC100, paste0("lik.thin.MC100_", s, ".RDS"))
+  print(s)
+}
+
+tic <- Sys.time()
+print(tic-toc)
+
+
+##########
+## SIR
+##########
+## The thin
+thin <- seq(1,45000, by=45)
+nSub <- 100
+
+SIR_mu_thin <- SIR_p_thin <- SIR_sigma_thin <- data.frame(matrix(NA, ncol=nSub, nrow=10000))
+
+tic <- Sys.time()
+for (s in 1:nSub){
+  ## The weights
+  weights <- readRDS(paste0("lik.thin.MC100_",s,".RDS"))
+
+    ## Posterior subsample distribution
+  posterior <- readRDS(paste0("posterior_",s,".RDS"))
+  
+  ## Parameters
+  mu.phi <- MCMCchains(posterior, params="mu", mcmc.list=TRUE) 
+  mu1 <- c(mu.phi[[1]], mu.phi[[2]], mu.phi[[3]])
+  mu <- mu1[thin]
+  
+  mean.p <- MCMCchains(posterior, params="mean.p", mcmc.list=TRUE)
+  p1 <- c(mean.p[[1]], mean.p[[2]], mean.p[[3]])
+  p <- p1[thin]
+  
+  mean.sigma2 <- MCMCchains(posterior, params="sigma2", mcmc.list=TRUE)
+  sigma2 <- c(mean.sigma2[[1]], mean.sigma2[[2]], mean.sigma2[[3]])
+  sigma1 <- sqrt(sigma2)
+  sigma <- sigma1[thin]
+  
+  SIR_mu <- sample(mu, 10000, replace = TRUE, prob = weights)
+  SIR_p <- sample(p, 10000, replace = TRUE, prob = weights)
+  SIR_sigma <- sample(sigma, 10000, replace = TRUE, prob = weights)
+  
+  SIR_mu_thin[,s] <- SIR_mu
+  SIR_p_thin[,s] <- SIR_p
+  SIR_sigma_thin[,s] <- SIR_sigma
+  
+  print(s)
+}
+toc <- Sys.time()
+print(toc-tic)
+
+## Save it
+saveRDS(SIR_mu_thin,"SIR_mu_thin.RDS")
+saveRDS(SIR_p_thin,"SIR_p_thin.RDS")
+saveRDS(SIR_sigma_thin,"SIR_sigma_thin.RDS")
+
+###########################
+## Combined SIR samples
+###########################
+combSIR_mu <- unlist(SIR_mu_thin)
+combSIR_p <- unlist(SIR_p_thin)
+combSIR_sigma <- unlist(SIR_sigma_thin)
+
+## 95%CI
+quantile(combSIR_mu, probs=c(0.025, 0.975))
+quantile(combSIR_p, probs=c(0.025, 0.975))
+quantile(combSIR_sigma, probs=c(0.025, 0.975))
+
+mean(combSIR_mu)
+mean(combSIR_p)
+mean(combSIR_sigma)
+
+sd(combSIR_mu)
+sd(combSIR_p)
+sd(combSIR_sigma)

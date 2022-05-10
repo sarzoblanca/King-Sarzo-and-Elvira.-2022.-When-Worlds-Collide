@@ -34,11 +34,11 @@ sigma <- 0.5
 epsilon <- rnorm(10450,0,sigma)
 
 # Draw annual survival probabilities
-logit.phi <- rnorm(sum(marked), (mu+epsilon), sigma) # rnorm uses sigma, not sigma^2
+logit.phi <- rnorm(sum(marked), (mu+epsilon), sigma) 
 phi <- plogis(logit.phi)
 
 # Define matrices with survival and recapture probabilities
-PHI <- matrix(phi, ncol = n.occasions-1, nrow = sum(marked),byrow = FALSE)
+PHI <- matrix(phi, ncol = n.occasions-1, nrow = sum(marked), byrow = FALSE)
 P <- matrix(p, ncol = n.occasions-1, nrow = sum(marked))
 
 # Define function to simulate a capture-history (CH) matrix
@@ -267,10 +267,6 @@ for (i in 1:max(num)){
 ## Heterogeneity model
 ## Model: logit(phi_it)= mu + epsilon_i ; p_it=p
 ## We run the chains in parallel
-## If we set epsilon ~ N(0, tau) the convergence is not good enough
-## with 8000 iterations (23 minutes)
-## In Kéry & Schaub book they propose a truncated zero-mean normal
-## e[i] ~ dnorm(0, tau)I(–20,20); reference: Kéry & Royle, 2009.
 
 sink("cjs_heter.jags")
 cat("
@@ -348,7 +344,7 @@ for (i in 1:10){
     return(state)
   }
   
-  ## Function  to create initial values of Z
+  ## Function to create initial values of Z
   cjs.init.z <- function(ch,f){
     for(i in 1: dim(ch)[1]){            
       if(sum(ch[i,])==1) next           
@@ -546,12 +542,6 @@ for (s in 1:nSub){
       loglik3[k,i] <- log(mean(exp(loglik[i,])))   # Calculate the log of the expected capture history probability
       loglik3a[k,i] <- x2.uniq1[i]*loglik3[k,i]    # Account for the number of individuals with history (on log scale)
     }
-    
-    ## We want the mean of the likelihood - so would simply usually exponentiate and taken the mean - 
-    ## but this leads to numerical underflow.
-    ## Thus we retain these values and will multiply by some large number (or add a large number of log scale)
-    ## This needs to be the same across all particles and so we simply retain the values here in a matrix
-    
   }
   
   # Due to numerical underflow we make an additive correction on the log scale applied to all particles. 

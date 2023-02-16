@@ -386,9 +386,9 @@ for (i in 1:10){
 tic <- Sys.time()
 print(tic-toc) 
 
-###########################
-## THINNING APPROACH
-###########################
+########################################
+## 1. THINNING APPROACH - MC ALGORITHM
+########################################
 ##############
 ## N= 1,000
 ##############
@@ -566,6 +566,72 @@ for (s in 1:nSub){
 tic <- Sys.time()
 print(tic-toc)
 
+########################
+## 2. QUADRATURE
+########################
+## Log-likelihood function
+likfn.QUAD <- function(phi1,hist,f1,l1,p1,n.occasions,epsilon,sigma,mu) {
+  lik <- 0
+  if (f1!=l1) {
+    lik <- lik + (l1-f1)*log(phi1)
+    
+    for (j in f1:(l1-1)) {
+      lik <- lik + hist[j+1]*log(p1) + (1-hist[j+1])*log(1-p1)
+    }
+  }
+  
+  # To calculate the probability of not being observed 
+  # again in the study:
+  chi <- 1
+  if (l1 < n.occasions){
+    for (j in (n.occasions-1):l1){
+      chi <- (1-phi1) + phi1*(1-p1)*chi
+    }
+  }
+  lik <- lik + log(chi)
+  loglik <- lik + dnorm(epsilon,0,sigma, log=T)
+  loglik <- loglik + epsilon^2
+  exp(loglik)
+}
+
+norule <- 20
+rule20 <- gaussHermiteData(20)
+
+loglik.QUAD <- loglik2.QUAD <- array(0,dim=c(n.x2,norule))
+loglik3.QUAD <- loglik3b.QUAD <- array(0,dim=c(n.iter,n.x2))
+loglik3a.QUAD20 <- array(0,dim=c(n.iter,n.x2))
+loglik4.QUAD <- array(0,n.iter)
+
+ for (m in 1:n.iter){
+  for (i in 1:n.x2){
+    for (k in 1:norule){
+      
+      epsilon <- rule50$x[k]
+      phi.new <- 1/(1+exp(-epsilon-mu[m]))
+      
+      # Calculate log-likelihood conditional on epsilon
+      
+      hist <- x2[i,]
+      
+      loglik.QUAD[i,k] <- likfn.QUAD(phi1=phi.new,hist=hist,f1=f[i],l1=l[i],p1=p[m],n.occasions, epsilon=epsilon, sigma=sigma[m], mu=mu[m])
+    }
+    loglik3.QUAD[m,i] <- sum(loglik.QUAD[i,]*rule50$w)
+    loglik3a.QUAD20[m,i] <- x2.uniq1[i]*log(loglik3.QUAD[m,i])
+  }
+  print(m)
+}
+
+#######################################
+## Correct for numerical under flow
+#######################################
+maxloglik.QUAD <- mean(loglik3a.QUAD20)
+loglik3b.QUAD <- loglik3a.QUAD20 - maxloglik.QUAD
+
+## Normalise weights - comparable with MC approach
+####################################################
+for (m in 1:n.iter){
+  loglik4.QUAD[m] <- exp(sum(loglik3b.QUAD[m,]))
+}
 
 ##########
 ## SIR

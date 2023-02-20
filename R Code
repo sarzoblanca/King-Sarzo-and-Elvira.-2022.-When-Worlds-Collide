@@ -114,9 +114,9 @@ for (i in 1:max(num)){
 last.seen <- function(x) max(which(x!=0))
 get.first <- function(x) min(which(x!=0))
 
-##############
-## 2.1. NIMBLE
-##############
+################################
+## 2.1. NIMBLE - with chi term
+################################
 ## Code
 modelSIM <- nimbleCode({
   # Priors and constraints
@@ -139,17 +139,21 @@ modelSIM <- nimbleCode({
   
   # Likelihood
   for (i in 1:nind){
-    # Define latent state at first capture
-    z[i,f[i]] <- 1
-    for (t in (f[i]+1):n.occasions){
-      # State process
-      z[i,t] ~ dbern(mu1[i,t])
-      mu1[i,t] <- phi[i,t-1] * z[i,t-1]
+    for (t in (f[i]+1):l[i]){
+      z[i,t] ~ dbern(phi[i,(t-1)])
       # Observation process
-      y[i,t] ~ dbern(mu2[i,t])
-      mu2[i,t] <- p[i,t-1] * z[i,t]
-    } 
-  } 
+      y[i,t] ~ dbern(p[i,(t)])
+    }
+  }
+  ## Define the likelihood for the not seen indiv's
+  ## Chi-term!
+  for (i in 1:nind){
+    chi[i,n.occasions] <- 1
+    for (t in l[i]:(n.occasions-1)){
+      chi[i,t] <- 1 - phi[i,t]*(1-(1-p[i,t+1])*(chi[i,t+1]))
+    }
+    z[i,f[i]] ~ dbern(chi[i,l[i]])
+  }
 })
 
 toc <- Sys.time()

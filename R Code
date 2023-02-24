@@ -123,7 +123,7 @@ modelSIM <- nimbleCode({
   for (i in 1:nind){
     for (t in f[i]:(n.occasions-1)){
       logit(phi[i,t]) <- alpha + epsilon[i]
-      p[i,t] <- mean.p
+      p[i,t+1] <- mean.p
     } 
   }
   for (i in 1:nind){
